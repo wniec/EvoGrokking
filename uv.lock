@@ -190,6 +190,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "matplotlib" },
+    { name = "neat-python" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "torch" },
@@ -200,6 +201,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "matplotlib", specifier = ">=3.8" },
+    { name = "neat-python", specifier = ">=2.0" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "torch", specifier = ">=2.4" },
     { name = "torchvision", specifier = ">=0.19" },
@@ -537,6 +539,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e0/47/dd32fa426cc72114383ac549964eecb20ecfd886d1e5ccf5340b55b02f57/mpmath-1.3.0.tar.gz", hash = "sha256:7a28eb2a9774d00c7bc92411c19a89209d5da7c4c9a9e227be8330a23a25b91f", size = 508106, upload-time = "2023-03-07T16:47:11.061Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/43/e3/7d92a15f894aa0c9c4b49b8ee9ac9850d6e63b03c9c32c0367a13ae62209/mpmath-1.3.0-py3-none-any.whl", hash = "sha256:a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c", size = 536198, upload-time = "2023-03-07T16:47:09.197Z" },
+]
+
+[[package]]
+name = "neat-python"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/78/2d/6d3d96cde074bcbdc3fae08383bb6a9b2da2f98c405d16acceccc36c14c3/neat_python-2.0.0.tar.gz", hash = "sha256:fcfb5020aa3df5c12638865296589159939db08e9aa4191d9cf4e5b242a5d9cf", size = 126031, upload-time = "2026-03-02T17:13:16.587Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b2/a6/e85e39f593e3bd8ccc2dc57abf60c9a51fbc542616531629d988c05de484/neat_python-2.0.0-py3-none-any.whl", hash = "sha256:4ba18bec7b1d1dfa659348e28156f36007ebc111d46eb4ddc07a128377b459f7", size = 54056, upload-time = "2026-03-02T17:13:15.233Z" },
 ]
 
 [[package]]

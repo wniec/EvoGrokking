@@ -18,8 +18,11 @@ arbitrary skip connections line up).  The input node is the image ``(C, H, W)``.
 Edges into the output node global-average-pool the source map and apply a
 ``Linear`` to the class logits -- a standard GAP classifier head.
 
-``init_scale`` multiplies every weight -- a large initial weight norm together
-with weight decay is a documented driver of grokking (Liu et al., "Omnigrok").
+The training recipe (``init_scale``, ``dropout``, ``embed_dim``) is *not* part
+of the genome -- it arrives as a :class:`~evogrokking.hyperparams.Hyperparams`
+fixed for the whole run.  ``init_scale`` multiplies every weight; a large initial
+weight norm together with weight decay is a documented driver of grokking (Liu et
+al., "Omnigrok").
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ import torch.nn as nn
 
 from evogrokking.datasets import DatasetSpec
 from evogrokking.genome import INPUT, OUTPUT, Genome
+from evogrokking.hyperparams import Hyperparams
 
 _ACT = {
     "relu": torch.relu,
@@ -78,10 +82,12 @@ def _topo_order(conns, active: set[int]) -> list[int]:
 class GrokNet(nn.Module):
     """Network described by a NEAT graph genome (linear or convolutional)."""
 
-    def __init__(self, genome: Genome, spec: DatasetSpec):
+    def __init__(self, genome: Genome, spec: DatasetSpec, hp: Hyperparams | None = None):
         super().__init__()
+        hp = hp or Hyperparams.for_task(spec.task)
         self.spec = spec
-        self.dropout_p = genome.dropout
+        self.hp = hp
+        self.dropout_p = hp.dropout
         self.is_conv = bool(genome.conv and spec.image_shape is not None)
 
         # Per-node output size: units (linear) or channels (conv); the input and
@@ -100,8 +106,8 @@ class GrokNet(nn.Module):
             self.kernels: dict[int, int] = {}
         elif spec.task == "modular":
             assert spec.vocab_size is not None
-            self.embedding = nn.Embedding(spec.vocab_size, genome.embed_dim)
-            sizes = {INPUT: spec.input_dim * genome.embed_dim, OUTPUT: spec.num_classes}
+            self.embedding = nn.Embedding(spec.vocab_size, hp.embed_dim)
+            sizes = {INPUT: spec.input_dim * hp.embed_dim, OUTPUT: spec.num_classes}
         else:
             self.embedding = None
             sizes = {INPUT: spec.input_dim, OUTPUT: spec.num_classes}
@@ -132,7 +138,7 @@ class GrokNet(nn.Module):
             {str(n): nn.Parameter(torch.zeros(sizes[n])) for n in self.order}
         )
         self.input_used = INPUT in active
-        self._scale_init(genome.init_scale)
+        self._scale_init(hp.init_scale)
 
     def _make_edge(self, sizes: dict[int, int], src: int, dst: int) -> nn.Module:
         if not self.is_conv:
@@ -207,8 +213,10 @@ class GrokNet(nn.Module):
         return vals[OUTPUT]
 
 
-def build_model(genome: Genome, spec: DatasetSpec) -> GrokNet:
-    return GrokNet(genome, spec)
+def build_model(
+    genome: Genome, spec: DatasetSpec, hp: Hyperparams | None = None
+) -> GrokNet:
+    return GrokNet(genome, spec, hp)
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -220,7 +228,9 @@ def count_parameters(model: nn.Module) -> int:
 _ACT_OVERHEAD = 3.0
 
 
-def estimated_activation_mb(genome: Genome, spec: DatasetSpec, batch_size: int) -> float:
+def estimated_activation_mb(
+    genome: Genome, spec: DatasetSpec, batch_size: int, embed_dim: int = 128
+) -> float:
     """Estimate the peak activation memory (MB) of a full-batch fwd+bwd pass.
 
     Used as a cheap, build-free guard so the evolutionary search can skip
@@ -236,7 +246,7 @@ def estimated_activation_mb(genome: Genome, spec: DatasetSpec, batch_size: int) 
         elems = batch_size * c0 * spatial  # input feature map
         elems += batch_size * sum(n.width * spatial for n in genome.nodes)
     else:
-        in_dim = spec.input_dim * (genome.embed_dim if spec.task == "modular" else 1)
+        in_dim = spec.input_dim * (embed_dim if spec.task == "modular" else 1)
         elems = batch_size * in_dim
         elems += batch_size * sum(n.width for n in genome.nodes)
     return elems * 4 * _ACT_OVERHEAD / (1024 * 1024)

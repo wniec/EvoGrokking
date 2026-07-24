@@ -1,13 +1,19 @@
-"""Evolutionary architecture search for grokking.
+"""Evolutionary architecture search for *minimal* grokking.
 
-A NEAT genetic algorithm searches the space of network *graphs* and
-regularisation strengths (:class:`~evogrokking.genome.Genome`) for the recipe
-that maximises grokking.  Each individual's fitness is obtained by actually
-training it (:func:`~evogrokking.train.train_and_evaluate`) and scoring the run
-with :meth:`~evogrokking.metrics.GrokkingMetrics.score`, whose *primary* term is
-the grokking area and whose low-weight *supporting* term is final test accuracy.
+A NEAT genetic algorithm -- supplied by
+`neat-python <https://neat-python.readthedocs.io>`_, see
+:mod:`evogrokking.neat_arch` -- searches the space of network *graphs* for the
+architecture that generalises **as early as possible** while still ending up
+accurate.  Each individual's fitness is obtained by actually training it
+(:func:`~evogrokking.train.train_and_evaluate`) and scoring the run with
+:meth:`~evogrokking.metrics.GrokkingMetrics.score`, which rewards high final
+accuracy, a small train/validation gap and early generalisation.
 
-The loop is a standard generational GA with elitism and tournament selection.
+Only the architecture evolves.  The training recipe
+(:class:`~evogrokking.hyperparams.Hyperparams`) is fixed for the whole run and
+shared by every individual, so differences in fitness are attributable to the
+graph rather than to a luckier learning rate.
+
 Because every fitness evaluation is an independent training run, the population
 is evaluated **in parallel** across worker processes when ``workers > 1`` (a
 ``ProcessPoolExecutor`` with the ``spawn`` start method, so it is CUDA-safe).
@@ -19,18 +25,22 @@ individual can be retrained identically afterwards from that same seed.
 from __future__ import annotations
 
 import json
-import random
+import os
+import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from multiprocessing import get_context
 from typing import Callable
 
+import neat
 import torch
 
 from evogrokking.datasets import Dataset
-from evogrokking.genome import Genome, Innovations
+from evogrokking.genome import Genome
+from evogrokking.hyperparams import Hyperparams
 from evogrokking.models import estimated_activation_mb
+from evogrokking.neat_arch import ArchGenome, to_genome, write_config
 from evogrokking.train import (
     EarlyStopping,
     TrainResult,
@@ -56,20 +66,32 @@ class Individual:
 class EvolutionConfig:
     population_size: int = 20
     generations: int = 10
-    elitism: int = 2
-    tournament_size: int = 3
-    crossover_prob: float = 0.6
-    mutation_rate: float = 0.3
     epochs_per_eval: int = 1500  # maximum iterations per fitness evaluation
     eval_every: int = 2
-    test_weight: float = 0.1  # low weight on final test acc
-    acc_weight: float = 5.0  # weight on the accuracy-curve area in the magnitude
-    gen_threshold: float = 0.9  # val-acc a run must reach to count as grokking
     seed: int = 0
     workers: int = 1  # >1 evaluates the population across that many processes
     allow_conv: bool = False  # image tasks: evolve convolutional feature maps
     conv_pool: int = 1  # conv mode: input downsample factor (memory knob)
     mem_budget_mb: float | None = None  # skip genomes whose est. activation memory exceeds this
+    hyperparams: Hyperparams = field(default_factory=Hyperparams)
+
+    # -- objective weights (see GrokkingMetrics.score) ---------------------
+    acc_weight: float = 1.0  # weight on final validation accuracy
+    gap_weight: float = 1.0  # reward for a small train/validation accuracy gap
+    speed_weight: float = 1.0  # reward for generalising early
+    gen_threshold: float = 0.9  # val-acc a run must reach to unlock those rewards
+
+    # -- neat-python knobs -------------------------------------------------
+    elitism: int = 2
+    survival_threshold: float = 0.2
+    compatibility_threshold: float = 3.0
+    max_stagnation: int = 15
+    species_elitism: int = 2
+    conn_add_prob: float = 0.5
+    conn_delete_prob: float = 0.2
+    node_add_prob: float = 0.3
+    node_delete_prob: float = 0.15
+
     # Early stopping (applied to each individual's training run). ``patience`` is
     # counted in evaluations (i.e. units of ``eval_every`` epochs); None disables.
     early_stop_patience: int | None = None
@@ -94,9 +116,10 @@ def _init_worker(dataset: Dataset, device_str: str) -> None:
 
 def _score(result: TrainResult, ec: dict) -> float:
     return result.metrics.score(
-        test_weight=ec["test_weight"],
-        gen_threshold=ec["gen_threshold"],
         acc_weight=ec["acc_weight"],
+        gap_weight=ec["gap_weight"],
+        speed_weight=ec["speed_weight"],
+        gen_threshold=ec["gen_threshold"],
     )
 
 
@@ -118,6 +141,7 @@ def _train_one(genome: Genome, dataset: Dataset, device, ec: dict) -> TrainResul
     return train_and_evaluate(
         genome,
         dataset,
+        hp=Hyperparams.from_dict(ec["hyperparams"]),
         epochs=ec["epochs"],
         eval_every=ec["eval_every"],
         device=device,
@@ -129,6 +153,12 @@ def _train_one(genome: Genome, dataset: Dataset, device, ec: dict) -> TrainResul
 
 # --------------------------------------------------------------------------
 class Evolution:
+    """Drives a neat-python population, training every genome to score it."""
+
+    # Genomes over the memory budget are not trained; they get a fitness below
+    # any real score so the search abandons them (rather than risking an OOM).
+    _OVER_BUDGET_FITNESS = -1e6
+
     def __init__(
         self,
         dataset: Dataset,
@@ -136,155 +166,156 @@ class Evolution:
         device: torch.device | None = None,
         on_generation: Callable[[int, list[Individual]], None] | None = None,
         logfile: str | None = None,
+        config_path: str | None = None,
     ):
         self.dataset = dataset
         self.config = config or EvolutionConfig()
         self.device = device or default_device()
-        self.rng = random.Random(self.config.seed)
-        self.innov = Innovations()
         self.on_generation = on_generation
         self.logfile = logfile
-        self._next_id = 0
+        # neat-python is configured from a file; write one next to the results so
+        # the exact search settings are recorded with the run.  With no run
+        # directory to write into, fall back to a scratch dir rather than
+        # dropping the file into the current working directory.
+        if config_path is None:
+            run_dir = os.path.dirname(logfile) if logfile else tempfile.mkdtemp()
+            config_path = os.path.join(run_dir, "neat_config.ini")
+        self.config_path = config_path
         self.history: list[dict] = []
         self.best: Individual | None = None
+        self._generation = 0
+        self._pool: ProcessPoolExecutor | None = None
 
     # -- helpers -----------------------------------------------------------
-    def _tag(self, genome: Genome) -> Genome:
-        tagged = replace(genome, id=self._next_id)
-        self._next_id += 1
-        return tagged
-
     def _eval_params(self) -> dict:
         cfg = self.config
         return {
             "epochs": cfg.epochs_per_eval,
             "eval_every": cfg.eval_every,
-            "test_weight": cfg.test_weight,
             "acc_weight": cfg.acc_weight,
+            "gap_weight": cfg.gap_weight,
+            "speed_weight": cfg.speed_weight,
             "gen_threshold": cfg.gen_threshold,
             "seed": cfg.seed,
+            "hyperparams": cfg.hyperparams.as_dict(),
             "es_patience": cfg.early_stop_patience,
             "es_min_delta": cfg.early_stop_min_delta,
             "es_target": cfg.early_stop_target_val_acc,
         }
 
-    def _tournament(self, population: list[Individual]) -> Individual:
-        contenders = self.rng.sample(
-            population, min(self.config.tournament_size, len(population))
+    def _neat_config(self) -> neat.Config:
+        cfg = self.config
+        write_config(
+            self.config_path,
+            pop_size=cfg.population_size,
+            conv=cfg.allow_conv,
+            elitism=cfg.elitism,
+            survival_threshold=cfg.survival_threshold,
+            compatibility_threshold=cfg.compatibility_threshold,
+            max_stagnation=cfg.max_stagnation,
+            species_elitism=cfg.species_elitism,
+            conn_add_prob=cfg.conn_add_prob,
+            conn_delete_prob=cfg.conn_delete_prob,
+            node_add_prob=cfg.node_add_prob,
+            node_delete_prob=cfg.node_delete_prob,
         )
-        return max(contenders, key=lambda ind: ind.fitness)
+        return neat.Config(
+            ArchGenome,
+            neat.DefaultReproduction,
+            neat.DefaultSpeciesSet,
+            neat.DefaultStagnation,
+            self.config_path,
+        )
 
-    # Genomes over the memory budget are not trained; they get a fitness below
-    # any real score so the search abandons them (rather than risking an OOM).
-    _OVER_BUDGET_FITNESS = -1.0
-
-    def _filter_budget(self, pending: list[Individual]) -> list[Individual]:
-        """Skip genomes whose estimated activation memory exceeds the budget."""
+    def _over_budget(self, genome: Genome) -> bool:
         budget = self.config.mem_budget_mb
         if budget is None:
-            return pending
-        batch = len(self.dataset.x_train)
-        keep, skipped = [], 0
-        for ind in pending:
-            mb = estimated_activation_mb(ind.genome, self.dataset.spec, batch)
-            if mb > budget:
+            return False
+        mb = estimated_activation_mb(
+            genome,
+            self.dataset.spec,
+            len(self.dataset.x_train),
+            embed_dim=self.config.hyperparams.embed_dim,
+        )
+        return mb > budget
+
+    # -- fitness -----------------------------------------------------------
+    def _evaluate(self, neat_genomes, neat_config) -> list[Individual]:
+        """neat-python's fitness callback: train every genome and score it."""
+        cfg = self.config
+        ec = self._eval_params()
+
+        individuals: list[tuple[object, Individual]] = []
+        pending: list[Individual] = []
+        skipped = 0
+        for _gid, ng in neat_genomes:
+            genome = to_genome(ng, conv=cfg.allow_conv, conv_pool=cfg.conv_pool)
+            ind = Individual(genome)
+            individuals.append((ng, ind))
+            if self._over_budget(genome):
                 ind.fitness = self._OVER_BUDGET_FITNESS
-                ind.result = None
                 skipped += 1
             else:
-                keep.append(ind)
+                pending.append(ind)
         if skipped:
-            print(f"  (skipped {skipped} genome(s) over {budget:.0f} MB memory budget)")
-        return keep
+            print(
+                f"  (skipped {skipped} genome(s) over "
+                f"{cfg.mem_budget_mb:.0f} MB memory budget)"
+            )
 
-    # -- evaluation (sequential or parallel) -------------------------------
-    def _evaluate(self, pending: list[Individual], pool: ProcessPoolExecutor | None) -> None:
-        pending = self._filter_budget(pending)
-        if not pending:
-            return
-        ec = self._eval_params()
-        if pool is None:
+        if self._pool is None:
             for ind in pending:
                 ind.result = _train_one(ind.genome, self.dataset, self.device, ec)
                 ind.fitness = _score(ind.result, ec)
-            return
+        else:
+            by_id = {ind.genome.id: ind for ind in pending}
+            tasks = [(ind.genome, ec) for ind in pending]
+            for gid, result, fitness in self._pool.map(_eval_worker, tasks):
+                ind = by_id[gid]
+                ind.result = result
+                ind.fitness = fitness
 
-        by_id = {ind.genome.id: ind for ind in pending}
-        tasks = [(ind.genome, ec) for ind in pending]
-        for gid, result, fitness in pool.map(_eval_worker, tasks):
-            ind = by_id[gid]
-            ind.result = result
-            ind.fitness = fitness
+        # Hand the scores back to neat-python, which drives selection with them.
+        for ng, ind in individuals:
+            ng.fitness = float(ind.fitness)
+        return [ind for _ng, ind in individuals]
 
     # -- main loop ---------------------------------------------------------
     def run(self) -> Individual:
         cfg = self.config
-        population = [
-            Individual(
-                self._tag(
-                    Genome.random(
-                        self.rng,
-                        self.innov,
-                        allow_conv=cfg.allow_conv,
-                        conv_pool=cfg.conv_pool,
-                    )
-                )
-            )
-            for _ in range(cfg.population_size)
-        ]
+        neat_config = self._neat_config()
+        population = neat.Population(neat_config, seed=cfg.seed)
 
-        pool = None
         if cfg.workers > 1:
             ctx = get_context("spawn")
-            pool = ProcessPoolExecutor(
+            self._pool = ProcessPoolExecutor(
                 max_workers=cfg.workers,
                 mp_context=ctx,
                 initializer=_init_worker,
                 initargs=(self.dataset, str(self.device)),
             )
+
+        def fitness_function(genomes, config) -> None:
+            t0 = time.time()
+            individuals = self._evaluate(genomes, config)
+            individuals.sort(key=lambda i: i.fitness, reverse=True)
+            gen_best = individuals[0]
+            if self.best is None or gen_best.fitness > self.best.fitness:
+                self.best = gen_best
+            self._record(self._generation, individuals, time.time() - t0)
+            if self.on_generation:
+                self.on_generation(self._generation, individuals)
+            self._generation += 1
+
         try:
-            for gen in range(cfg.generations):
-                t0 = time.time()
-                self._evaluate([i for i in population if i.result is None], pool)
-
-                population.sort(key=lambda i: i.fitness, reverse=True)
-                gen_best = population[0]
-                if self.best is None or gen_best.fitness > self.best.fitness:
-                    self.best = gen_best
-
-                self._record(gen, population, time.time() - t0)
-                if self.on_generation:
-                    self.on_generation(gen, population)
-
-                if gen == cfg.generations - 1:
-                    break
-                population = self._next_generation(population)
+            population.run(fitness_function, cfg.generations)
         finally:
-            if pool is not None:
-                pool.shutdown()
+            if self._pool is not None:
+                self._pool.shutdown()
+                self._pool = None
 
         assert self.best is not None
         return self.best
-
-    def _next_generation(self, population: list[Individual]) -> list[Individual]:
-        cfg = self.config
-        # Elitism: carry the best individuals over unchanged (and un-re-evaluated).
-        next_pop = [
-            Individual(ind.genome, ind.fitness, ind.result)
-            for ind in population[: cfg.elitism]
-        ]
-        while len(next_pop) < cfg.population_size:
-            if self.rng.random() < cfg.crossover_prob:
-                a = self._tournament(population)
-                b = self._tournament(population)
-                fitter, other = (a, b) if a.fitness >= b.fitness else (b, a)
-                child = Genome.crossover(fitter.genome, other.genome, self.rng)
-                child = child.mutate(self.rng, self.innov, cfg.mutation_rate)
-            else:
-                parent = self._tournament(population).genome
-                child = parent.mutate(self.rng, self.innov, cfg.mutation_rate)
-            next_pop.append(Individual(self._tag(child)))
-        return next_pop
 
     # -- logging -----------------------------------------------------------
     def _record(self, gen: int, population: list[Individual], secs: float) -> None:
@@ -303,9 +334,9 @@ class Evolution:
             f"[gen {gen:3d}] best={best.fitness:.4f} "
             f"mean={entry['mean_fitness']:.4f} "
             + (
-                f"grok_area={m.grok_area:.3f} acc_area={m.acc_area:.3f} "
-                f"val_acc={m.final_val_acc:.1%} drop={m.val_loss_drop:.1f} "
-                f"{'GROK' if m.generalised else 'overfit'} "
+                f"val_acc={m.final_val_acc:.1%} gap={m.acc_area:.3f} "
+                f"gen_at={m.gen_frac:.2f} grok={m.grok_magnitude():.2f} "
+                f"{'early' if m.generalised and m.gen_frac < 0.5 else 'late/none'} "
                 if m
                 else ""
             )

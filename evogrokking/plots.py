@@ -133,7 +133,7 @@ def _layered_layout(genome: Genome) -> tuple[dict[int, int], list[int]]:
 
 
 def plot_genome(
-    genome: Genome, out_path: str, *, spec=None, title: str = ""
+    genome: Genome, out_path: str, *, spec=None, title: str = "", embed_dim: int = 128
 ) -> str:
     """Render the evolved network as a left-to-right graph. Returns ``out_path``.
 
@@ -175,7 +175,7 @@ def plot_genome(
             if spec is None:
                 return "input"
             if spec.task == "modular":
-                return f"input\n2×{genome.embed_dim} emb"
+                return f"input\n2×{embed_dim} emb"
             if is_conv and spec.image_shape:
                 c, h, w = spec.image_shape
                 pooled = f" ÷{genome.conv_pool}" if genome.conv_pool > 1 else ""

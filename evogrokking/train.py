@@ -35,6 +35,7 @@ import torch.nn as nn
 
 from evogrokking.datasets import Dataset
 from evogrokking.genome import Genome
+from evogrokking.hyperparams import Hyperparams
 from evogrokking.metrics import GEN_THRESHOLD, GrokkingMetrics, grokking_metrics
 from evogrokking.models import GrokNet, build_model, count_parameters
 
@@ -125,23 +126,24 @@ def _seed_everything(seed: int) -> None:
         pass
 
 
-def _make_optimizer(genome: Genome, model: nn.Module) -> torch.optim.Optimizer:
-    if genome.optimizer == "adam":
+def _make_optimizer(hp: Hyperparams, model: nn.Module) -> torch.optim.Optimizer:
+    """Build the optimiser from the run's fixed recipe (not from the genome)."""
+    if hp.optimizer == "adam":
         return torch.optim.Adam(
-            model.parameters(), lr=genome.lr, weight_decay=genome.weight_decay
+            model.parameters(), lr=hp.lr, weight_decay=hp.weight_decay
         )
-    if genome.optimizer == "adamw":
+    if hp.optimizer == "adamw":
         return torch.optim.AdamW(
-            model.parameters(), lr=genome.lr, weight_decay=genome.weight_decay
+            model.parameters(), lr=hp.lr, weight_decay=hp.weight_decay
         )
-    if genome.optimizer == "sgd":
+    if hp.optimizer == "sgd":
         return torch.optim.SGD(
             model.parameters(),
-            lr=genome.lr,
-            weight_decay=genome.weight_decay,
+            lr=hp.lr,
+            weight_decay=hp.weight_decay,
             momentum=0.9,
         )
-    raise ValueError(f"unknown optimizer {genome.optimizer!r}")
+    raise ValueError(f"unknown optimizer {hp.optimizer!r}")
 
 
 @torch.no_grad()
@@ -156,6 +158,7 @@ def train_and_evaluate(
     genome: Genome,
     dataset: Dataset,
     *,
+    hp: Hyperparams | None = None,
     epochs: int = 2000,
     device: torch.device | None = None,
     eval_every: int = 1,
@@ -167,6 +170,9 @@ def train_and_evaluate(
     return_model: bool = False,
 ) -> TrainResult:
     """Train ``genome`` on ``dataset`` and return its grokking metrics.
+
+    ``hp`` is the run's fixed training recipe; it defaults to the per-task
+    defaults of :meth:`Hyperparams.for_task`.
 
     ``epochs`` is the maximum number of iterations.  ``eval_every`` sub-samples
     the loss curves to save time on long runs; the grokking area is computed on
@@ -180,12 +186,13 @@ def train_and_evaluate(
     to get the trained module back instead).
     """
     device = device or default_device()
+    hp = hp or Hyperparams.for_task(dataset.spec.task)
     if seed is not None:
         _seed_everything(seed)
     dataset = dataset.to(device)
-    model = (model or build_model(genome, dataset.spec)).to(device)
+    model = (model or build_model(genome, dataset.spec, hp)).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = _make_optimizer(genome, model)
+    optimizer = _make_optimizer(hp, model)
 
     x_tr, y_tr = dataset.x_train, dataset.y_train
     x_va, y_va = dataset.x_val, dataset.y_val

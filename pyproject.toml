@@ -1,7 +1,7 @@
 [project]
 name = "evogrokking"
 version = "0.1.0"
-description = "Evolving neural architectures that maximally induce grokking"
+description = "Evolving neural architectures that generalise without grokking"
 requires-python = ">=3.11"
 dependencies = [
     "torch>=2.4",
@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=1.26",
     "tqdm>=4.66",
     "matplotlib>=3.8",
+    "neat-python>=2.0",
 ]
 
 [tool.setuptools.packages.find]
