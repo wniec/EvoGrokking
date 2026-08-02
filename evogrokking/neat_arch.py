@@ -1,244 +1,235 @@
 """neat-python integration: reproduction is the library's job, not ours.
 
-This project used to carry a hand-written NEAT implementation (mutation,
-innovation-aligned crossover, the lot).  That is now delegated to
-`neat-python <https://neat-python.readthedocs.io>`_, which brings the parts the
-hand-rolled version never had -- **speciation**, stagnation handling and
-fitness sharing -- and is a maintained reference implementation of Stanley &
-Miikkulainen (2002).
+This is **classical NEAT** -- a node is one neuron, a connection is one scalar
+weight -- so almost nothing needs bridging: the node and connection genes are
+neat-python's own, and :func:`to_genome` is close to an identity mapping.
 
-Two things have to be bridged.
+Two adjustments are still required.
 
-**Nodes carry a width.**  A neat-python node is a single unit with a bias,
-response and activation; ours is a whole *layer* (or, in conv mode, a feature map
-with a kernel).  :class:`LayerNodeGene` extends the stock node gene with two
-extra evolvable attributes -- ``width`` and ``kernel_idx`` -- using neat-python's
-documented gene-attribute extension point, so the library mutates and crosses
-them over exactly like any built-in attribute.
+**Weights are not evolved.**  Connection weights and neuron biases come from
+gradient descent (that is what produces the learning curves the grokking metrics
+are measured on), so the stock ``weight``, ``bias`` and ``response`` genes are
+pinned to constants: zero variance, zero mutation rate.  They never vary, so they
+also never contribute to the compatibility distance.  What evolves is the
+topology plus each neuron's ``activation`` gene.
 
-**Weights are not evolved.**  Connection *weights* come from gradient descent, so
-the stock ``weight`` attribute is left in place (``mutate_add_node`` reads it)
-but pinned: zero variance, zero mutation rate.  It never varies, so it also never
-contributes to the compatibility distance.  Only ``enabled`` matters to us.
+**The founding population must share its structure.**  We deliberately start from
+a *big densely connected* network rather than NEAT's minimal seed, and
+neat-python's ``configure_new`` hands every initial genome its **own** hidden-node
+keys.  With ``num_hidden > 0`` that makes the whole population mutually
+non-homologous: every genome lands in its own species and crossover degenerates
+into copying, because every gene is disjoint.  :class:`ArchGenome` overrides
+``configure_new`` so all founding genomes share one set of hidden keys -- they
+represent the same founding structure, and are homologous as they should be.
 
-The population's genomes are translated into this project's
-:class:`~evogrokking.genome.Genome` phenotype by :func:`to_genome` before they are
-built and trained.
+Note on the compatibility threshold: neat-python normalises genomic distance by
+gene count, so distances are *mean per-gene* differences.  With a dense start
+(tens of thousands of connection genes) a handful of structural differences moves
+the distance by very little, so the useful threshold is far below the ~3.0
+typical of minimal-seed NEAT -- see ``--compatibility-threshold``.
 """
 
 from __future__ import annotations
 
 import os
+from itertools import count
+from pathlib import Path
+from random import random
 
-from neat.attributes import IntegerAttribute
 from neat.genes import DefaultConnectionGene, DefaultNodeGene
 from neat.genome import DefaultGenome, DefaultGenomeConfig
 
-from evogrokking.genome import (
-    ACTIVATIONS,
-    CONV_CH,
-    INPUT,
-    KERNEL_SIZES,
-    MAX_WIDTH,
-    MIN_WIDTH,
-    OUTPUT,
-    ConnGene,
-    Genome,
-    NodeGene,
-)
-
-# neat-python's key convention: inputs are negative, outputs are 0..num_outputs-1
-# and hidden nodes count up from num_outputs.  We use a single input "pin" (the
-# whole feature vector) and a single output "pin" (the logit vector).
-NEAT_INPUT_KEY = -1
-NEAT_OUTPUT_KEY = 0
+from evogrokking.genome import ACTIVATIONS, ConnGene, Genome, NodeGene
 
 
-class LayerNodeGene(DefaultNodeGene):
-    """A node gene that also carries the layer's ``width`` and kernel size.
-
-    ``width`` is the number of units (linear mode) or channels (conv mode);
-    ``kernel_idx`` indexes :data:`~evogrokking.genome.KERNEL_SIZES` so that
-    mutation can only ever land on a valid *odd* kernel -- an integer attribute
-    over the sizes themselves could drift onto an even value, which would break
-    the same-padding shape invariant that lets arbitrary skip connections line
-    up.
-    """
-
-    _gene_attributes = DefaultNodeGene._gene_attributes + [
-        IntegerAttribute("width"),
-        IntegerAttribute(
-            "kernel_idx",
-            # Defaults so a linear-mode config need not mention the kernel at all.
-            min_value=0,
-            max_value=len(KERNEL_SIZES) - 1,
-            mutate_rate=0.1,
-            replace_rate=0.05,
-            mutate_power=1.0,
-        ),
-    ]
-
-    def distance(self, other, config):
-        """Compatibility distance, extended with the width/kernel genes.
-
-        Widths are compared on a *relative* scale: 16 vs 32 units is a bigger
-        architectural difference than 496 vs 512, and an absolute difference
-        would otherwise swamp every other term for wide layers.
-        """
-        wa, wb = max(1, self.width), max(1, other.width)
-        extra = abs(wa - wb) / max(wa, wb)
-        if self.kernel_idx != other.kernel_idx:
-            extra += 1.0
-        # super() already scales its own terms by the weight coefficient; scale
-        # ours the same way so all node-gene terms stay commensurable.
-        return super().distance(other, config) + (
-            extra * config.compatibility_weight_coefficient
-        )
+def initial_hidden_keys(config) -> list[int]:
+    """The fixed hidden-node keys every founding genome shares."""
+    return [config.num_outputs + i for i in range(config.num_hidden)]
 
 
 class ArchGenome(DefaultGenome):
-    """A neat-python genome whose nodes are layers (see :class:`LayerNodeGene`)."""
+    """A neat-python genome whose founding population shares its hidden nodes."""
 
     @classmethod
     def parse_config(cls, param_dict):
-        param_dict["node_gene_type"] = LayerNodeGene
+        # Our own knob, not one of neat-python's; pop it before the library sees
+        # the dict and hang it on the resulting config for `mutate` to read.
+        rounds = int(param_dict.pop("structural_mutation_rounds", 1))
+        param_dict["node_gene_type"] = DefaultNodeGene
         param_dict["connection_gene_type"] = DefaultConnectionGene
-        return DefaultGenomeConfig(param_dict, section_name=cls.__name__)
+        config = DefaultGenomeConfig(param_dict, section_name=cls.__name__)
+        config.structural_mutation_rounds = max(1, rounds)
+        return config
+
+    def mutate(self, config):
+        """Apply the NEAT structural operators ``structural_mutation_rounds`` times.
+
+        neat-python performs *at most one* add/delete of each kind per genome per
+        generation.  That is well judged for a minimal seed, where a genome has
+        tens of genes and one change is a large relative move -- but this project
+        starts from a big dense network, where a genome can carry tens of
+        thousands of connection genes and a single deletion is a ~0.004 % change.
+        The search then cannot restructure anything in a reasonable number of
+        generations.  Repeating the operators makes the *step size* scale with the
+        genome instead of staying fixed at one gene.
+
+        Attribute mutation (activations) is applied once per genome regardless, so
+        raising the round count does not silently multiply the activation mutation
+        rate along with the structural one.
+        """
+        for _ in range(config.structural_mutation_rounds):
+            if random() < config.node_add_prob:
+                self.mutate_add_node(config)
+            if random() < config.node_delete_prob:
+                self.mutate_delete_node(config)
+            if random() < config.conn_add_prob:
+                self.mutate_add_connection(config)
+            if random() < config.conn_delete_prob:
+                self.mutate_delete_connection()
+
+        for cg in self.connections.values():
+            cg.mutate(config)
+        for ng in self.nodes.values():
+            ng.mutate(config)
+
+    def configure_new(self, config):
+        """Create a founding genome.
+
+        Identical to :meth:`DefaultGenome.configure_new` except that the initial
+        hidden nodes get **deterministic, shared** keys instead of fresh ones per
+        genome, so the founding population is homologous (see module docstring).
+        """
+        for node_key in config.output_keys:
+            self.nodes[node_key] = self.create_node(config, node_key)
+
+        hidden_keys = initial_hidden_keys(config)
+        for node_key in hidden_keys:
+            self.nodes[node_key] = self.create_node(config, node_key)
+
+        # Later add-node mutations must not collide with the shared keys.
+        if config.node_indexer is None:
+            config.node_indexer = count(config.num_outputs + config.num_hidden)
+
+        # Wire it up using neat-python's own connectivity helpers, which read
+        # self.nodes and therefore pick up the shared hidden keys.
+        if "fs_neat" in config.initial_connection:
+            if config.initial_connection == "fs_neat_nohidden":
+                self.connect_fs_neat_nohidden(config)
+            else:
+                self.connect_fs_neat_hidden(config)
+        elif "full" in config.initial_connection:
+            if config.initial_connection == "full_nodirect":
+                self.connect_full_nodirect(config)
+            else:
+                self.connect_full_direct(config)
+        elif "partial" in config.initial_connection:
+            if config.initial_connection == "partial_nodirect":
+                self.connect_partial_nodirect(config)
+            else:
+                self.connect_partial_direct(config)
 
 
 # --------------------------------------------------------------------------
-# Config file generation.  neat-python is configured from an INI file, so we
-# write one from the CLI options into the run directory -- which also leaves a
+# Config file generation.
+#
+# neat-python is configured from an INI file.  The template lives beside this
+# module in ``neat.config`` rather than inline here, so the settings can be read
+# (and diffed) as an ordinary config file; :func:`write_config` fills in its
+# placeholders and drops the result into the run directory, which also leaves a
 # record of the exact search settings alongside the results.
 # --------------------------------------------------------------------------
+#: The template rendered by :func:`write_config`.
+CONFIG_TEMPLATE = Path(__file__).with_name("neat.config")
+
+
 def write_config(
     path: str,
     *,
     pop_size: int,
-    conv: bool,
+    n_inputs: int,
+    n_outputs: int,
+    n_hidden: int,
+    initial_connection: str = "full_direct",
+    initial_connection_fraction: float = 1.0,
+    structural_mutation_rounds: int = 1,
     elitism: int = 2,
     survival_threshold: float = 0.2,
-    compatibility_threshold: float = 3.0,
+    compatibility_threshold: float = 0.2,
     max_stagnation: int = 15,
     species_elitism: int = 2,
-    conn_add_prob: float = 0.5,
-    conn_delete_prob: float = 0.2,
-    node_add_prob: float = 0.3,
-    node_delete_prob: float = 0.15,
-    width_mutate_rate: float = 0.2,
-    activation_mutate_rate: float = 0.1,
+    conn_add_prob: float = 0.3,
+    conn_delete_prob: float = 0.4,
+    node_add_prob: float = 0.15,
+    node_delete_prob: float = 0.2,
+    activation_mutate_rate: float = 0.05,
+    activation_default: str = "relu",
+    enabled_mutate_rate: float = 0.02,
 ) -> str:
-    """Write a neat-python config file and return its path.
+    """Render :data:`CONFIG_TEMPLATE` to ``path`` and return that path.
 
-    Width bounds depend on the mode: conv nodes are *channels* (kept small,
-    because a same-padding map costs ``batch x channels x H x W``), linear nodes
-    are units.
+    Deletion probabilities default *above* the addition ones: the search starts
+    from a big dense network, so the interesting direction is pruning it down to
+    the structure that generalises earliest.
+
+    ``activation_default`` is a concrete function rather than ``random`` so the
+    founding population is genuinely *one* structure.  Drawing each neuron's
+    activation at random would make the founders differ on ~3/4 of their nodes
+    before evolution even starts, which alone pushes the genomic distance past
+    any sane threshold and shatters the population into one species per genome.
+    Activations then diverge through mutation, as structure does.
+
+    ``initial_connection_fraction`` below 1.0 switches the ``full_*`` wiring to
+    the matching ``partial_*`` form, so each founding genome gets its **own**
+    random subset of the dense connectivity.  That is the cheapest source of
+    founding diversity: with full wiring every founder is byte-identical, so the
+    first generation evaluates the same network ``pop_size`` times and selection
+    has nothing to choose between.  The subsets stay homologous -- same node keys,
+    same innovation numbers for shared edges -- so crossover still aligns.
     """
-    w_min, w_max = CONV_CH if conv else (MIN_WIDTH, MAX_WIDTH)
-    # Mutation step: a fraction of the range, so widths drift rather than jump.
-    w_power = max(1.0, (w_max - w_min) / 10.0)
-    activations = " ".join(ACTIVATIONS)
-
-    text = f"""\
-# Generated by evogrokking -- see evogrokking/neat_arch.py.
-# Only the *architecture* is evolved here; the training recipe (lr, weight decay,
-# dropout, optimizer, init scale) is fixed for the whole run, see
-# evogrokking/hyperparams.py.
-[NEAT]
-fitness_criterion     = max
-fitness_threshold     = 1e9
-no_fitness_termination = True
-pop_size              = {pop_size}
-reset_on_extinction   = True
-
-[ArchGenome]
-# One input pin (the whole feature vector) and one output pin (the logits).
-num_inputs            = 1
-num_outputs           = 1
-num_hidden            = 0
-feed_forward          = True
-initial_connection    = full_direct
-
-compatibility_disjoint_coefficient = 1.0
-compatibility_weight_coefficient   = 0.5
-
-conn_add_prob         = {conn_add_prob}
-conn_delete_prob      = {conn_delete_prob}
-node_add_prob         = {node_add_prob}
-node_delete_prob      = {node_delete_prob}
-single_structural_mutation = False
-structural_mutation_surer  = default
-
-# --- layer width (units, or channels in conv mode) ---
-width_init_mean       = {(w_min + w_max) // 2}
-width_init_stdev      = 0
-width_min_value       = {w_min}
-width_max_value       = {w_max}
-width_mutate_rate     = {width_mutate_rate}
-width_mutate_power    = {w_power}
-width_replace_rate    = 0.1
-
-# --- conv kernel: an index into KERNEL_SIZES, so only odd sizes are reachable ---
-kernel_idx_min_value   = 0
-kernel_idx_max_value   = {len(KERNEL_SIZES) - 1}
-kernel_idx_mutate_rate = {0.15 if conv else 0.0}
-kernel_idx_mutate_power = 1.0
-kernel_idx_replace_rate = {0.05 if conv else 0.0}
-
-# --- activation ---
-activation_default      = random
-activation_options      = {activations}
-activation_mutate_rate  = {activation_mutate_rate}
-
-# --- aggregation: our nodes always sum their inputs ---
-aggregation_default     = sum
-aggregation_options     = sum
-aggregation_mutate_rate = 0.0
-
-# --- bias / response: unused. Our layers own their biases and train them by
-# --- gradient descent, so these genes are pinned to a constant.
-bias_init_mean        = 0.0
-bias_init_stdev       = 0.0
-bias_max_value        = 0.0
-bias_min_value        = 0.0
-bias_mutate_power     = 0.0
-bias_mutate_rate      = 0.0
-bias_replace_rate     = 0.0
-
-response_init_mean    = 1.0
-response_init_stdev   = 0.0
-response_max_value    = 1.0
-response_min_value    = 1.0
-response_mutate_power = 0.0
-response_mutate_rate  = 0.0
-response_replace_rate = 0.0
-
-# --- connection weight: also unused (weights come from gradient descent), but
-# --- neat-python's add-node mutation reads it, so it stays pinned at 1.
-weight_init_mean      = 1.0
-weight_init_stdev     = 0.0
-weight_max_value      = 1.0
-weight_min_value      = 1.0
-weight_mutate_power   = 0.0
-weight_mutate_rate    = 0.0
-weight_replace_rate   = 0.0
-
-enabled_default       = True
-enabled_mutate_rate   = 0.05
-
-[DefaultSpeciesSet]
-compatibility_threshold = {compatibility_threshold}
-
-[DefaultStagnation]
-species_fitness_func = max
-max_stagnation       = {max_stagnation}
-species_elitism      = {species_elitism}
-
-[DefaultReproduction]
-elitism            = {elitism}
-survival_threshold = {survival_threshold}
-min_species_size   = 2
-"""
+    if not 0.0 < initial_connection_fraction <= 1.0:
+        raise ValueError(
+            "initial_connection_fraction must be in (0, 1], got "
+            f"{initial_connection_fraction}"
+        )
+    if initial_connection_fraction < 1.0:
+        if not initial_connection.startswith("full"):
+            raise ValueError(
+                "initial_connection_fraction only applies to the full_* wirings, "
+                f"got {initial_connection!r}"
+            )
+        # neat-python spells partial connectivity "partial_direct <fraction>".
+        initial_connection = (
+            initial_connection.replace("full", "partial")
+            + f" {initial_connection_fraction}"
+        )
+    # ``##`` lines are notes to the template's author, not config: strip them so
+    # they never reach the generated file.
+    template = "\n".join(
+        line
+        for line in CONFIG_TEMPLATE.read_text().splitlines()
+        if not line.startswith("##")
+    )
+    text = template.format(
+        pop_size=pop_size,
+        n_inputs=n_inputs,
+        n_outputs=n_outputs,
+        n_hidden=n_hidden,
+        initial_connection=initial_connection,
+        structural_mutation_rounds=structural_mutation_rounds,
+        elitism=elitism,
+        survival_threshold=survival_threshold,
+        compatibility_threshold=compatibility_threshold,
+        max_stagnation=max_stagnation,
+        species_elitism=species_elitism,
+        conn_add_prob=conn_add_prob,
+        conn_delete_prob=conn_delete_prob,
+        node_add_prob=node_add_prob,
+        node_delete_prob=node_delete_prob,
+        activation_mutate_rate=activation_mutate_rate,
+        activation_default=activation_default,
+        enabled_mutate_rate=enabled_mutate_rate,
+        activations=" ".join(ACTIVATIONS),
+    ).rstrip("\n") + "\n"
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as f:
         f.write(text)
@@ -248,55 +239,29 @@ min_species_size   = 2
 # --------------------------------------------------------------------------
 # Translation: neat-python genome -> this project's phenotype description.
 # --------------------------------------------------------------------------
-def _map_key(key: int) -> int:
-    """neat-python node key -> :mod:`evogrokking.genome` node id.
-
-    ``-1`` (the single input pin) becomes ``INPUT``, ``0`` (the single output
-    pin) becomes ``OUTPUT``, and hidden keys -- which neat-python numbers from 1
-    upwards -- are shifted clear of both.
-    """
-    if key == NEAT_INPUT_KEY:
-        return INPUT
-    if key == NEAT_OUTPUT_KEY:
-        return OUTPUT
-    return key + 1
-
-
-def to_genome(
-    neat_genome, conv: bool = False, conv_pool: int = 1, genome_id: int | None = None
-) -> Genome:
+def to_genome(neat_genome, n_inputs: int, n_outputs: int) -> Genome:
     """Convert a ``neat-python`` genome into a :class:`~evogrokking.genome.Genome`.
 
-    Only hidden nodes become :class:`NodeGene`\\s: the input node is the dataset's
-    feature vector and the output node is the class logits, so neither has an
-    evolvable width or activation.
+    Node keys carry over unchanged -- both sides use neat-python's convention of
+    negative input keys, outputs ``0..n_outputs-1`` and hidden above that.
     """
     nodes = tuple(
-        NodeGene(
-            id=_map_key(key),
-            width=int(gene.width),
-            activation=gene.activation,
-            kernel_size=KERNEL_SIZES[
-                max(0, min(len(KERNEL_SIZES) - 1, int(gene.kernel_idx)))
-            ],
-        )
+        NodeGene(id=int(key), activation=gene.activation)
         for key, gene in sorted(neat_genome.nodes.items())
-        if key != NEAT_OUTPUT_KEY
     )
     conns = tuple(
         ConnGene(
             innovation=int(gene.innovation),
-            src=_map_key(src),
-            dst=_map_key(dst),
+            src=int(src),
+            dst=int(dst),
             enabled=bool(gene.enabled),
         )
         for (src, dst), gene in sorted(neat_genome.connections.items())
     )
-    gid = neat_genome.key if genome_id is None else genome_id
     return Genome(
         nodes=nodes,
         conns=conns,
-        conv=conv,
-        conv_pool=conv_pool if conv else 1,
-        id=int(gid),
+        n_inputs=n_inputs,
+        n_outputs=n_outputs,
+        id=int(neat_genome.key),
     )

@@ -4,8 +4,10 @@ Three families of task are supported, all reduced to in-memory tensors so that a
 whole evolutionary search (hundreds of short trainings) stays fast:
 
 * ``modadd``        -- p-modular addition ``(a + b) mod p`` as a classification
-  task over ``p`` classes, in the style of Power et al. 2022 and the reference
-  project in ``low_dimensional_grokking``.
+  task over ``p`` classes, in the style of Power et al. 2022.  The two operands
+  are **one-hot encoded** and concatenated into a ``2p`` feature vector: the
+  networks here are plain MLPs over a fixed input vector, with no embedding
+  layer, so the tokens have to arrive already encoded.
 * ``mnist`` / ``fashionmnist`` -- the image benchmarks, in the
   **distribution-shifted** form of Carvalho et al. (2025): each digit class is
   split into latent subclasses and a subset of them is under-sampled in the
@@ -37,10 +39,9 @@ class DatasetSpec:
 
     name: str
     task: str  # "modular" or "image"
-    input_dim: int  # flattened feature dim (image) or number of tokens (modular)
-    num_classes: int
-    vocab_size: int | None = None  # modulus p for modular tasks; None for images
-    image_shape: tuple[int, int, int] | None = None  # (C, H, W) for image tasks
+    input_dim: int  # length of the flat input vector -> one input neuron each
+    num_classes: int  # one output neuron each
+    image_shape: tuple[int, int, int] | None = None  # (C, H, W); image tasks only
 
 
 @dataclass
@@ -66,15 +67,25 @@ def modular_addition(p: int = 97, train_frac: float = 0.4, seed: int = 0) -> Dat
 
     ``train_frac`` controls the fraction of the ``p * p`` pairs used for training;
     small fractions with weight decay are what makes the task grok.
+
+    Each pair ``(a, b)`` becomes a ``2p``-dimensional vector: ``a`` one-hot in the
+    first ``p`` positions, ``b`` one-hot in the second.  There is no embedding
+    layer to learn a denser code -- the model is a plain MLP over these features.
     """
     g = torch.Generator().manual_seed(seed)
-    x = torch.cartesian_prod(torch.arange(p), torch.arange(p))
-    y = (x[:, 0] + x[:, 1]) % p
-    perm = torch.randperm(len(x), generator=g)
-    x, y = x[perm], y[perm]
+    pairs = torch.cartesian_prod(torch.arange(p), torch.arange(p))
+    y = (pairs[:, 0] + pairs[:, 1]) % p
+    perm = torch.randperm(len(pairs), generator=g)
+    pairs, y = pairs[perm], y[perm]
+
+    x = torch.zeros(len(pairs), 2 * p)
+    rows = torch.arange(len(pairs))
+    x[rows, pairs[:, 0]] = 1.0
+    x[rows, p + pairs[:, 1]] = 1.0
+
     n_train = int(train_frac * len(x))
     spec = DatasetSpec(
-        name=f"modadd_p{p}", task="modular", input_dim=2, num_classes=p, vocab_size=p
+        name=f"modadd_p{p}", task="modular", input_dim=2 * p, num_classes=p
     )
     return Dataset(spec, x[:n_train], y[:n_train], x[n_train:], y[n_train:])
 
@@ -130,8 +141,7 @@ def _image_dataset(
         task="image",
         input_dim=x_train.shape[1],
         num_classes=int(max(y_train.max(), y_val.max()) + 1),
-        vocab_size=None,
-        image_shape=(1, h, w),  # single-channel; the conv path reshapes to this
+        image_shape=(1, h, w),  # single-channel; used by the subclass clustering
     )
     return Dataset(spec, x_train, y_train, x_val, y_val)
 
@@ -212,7 +222,6 @@ def _shifted_image_dataset(
         task="image",
         input_dim=x_train.shape[1],
         num_classes=int(max(y_train.max(), y_val.max()) + 1),
-        vocab_size=None,
         image_shape=image_shape,
     )
     return Dataset(spec, x_train, y_train, x_val, y_val)

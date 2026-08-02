@@ -1,28 +1,25 @@
-"""Turn a NEAT graph :class:`~evogrokking.genome.Genome` into a trainable network.
+"""Turn a classical NEAT graph :class:`~evogrokking.genome.Genome` into a
+trainable MLP.
 
-The genome is an arbitrary directed-acyclic graph of nodes, evaluated in
-topological order.  Only the sub-graph that can reach the output is built, so
-disconnected genes cost nothing.  There are two modes:
+The genome is an arbitrary directed-acyclic graph of **individual neurons**: each
+node is one unit with a bias and an activation, each enabled edge is one scalar
+weight.  Only the sub-graph that can reach an output is built, so disconnected
+neurons cost nothing.
 
-**Linear mode** (modular tasks, and image tasks without ``--conv``).  Each node
-holds a vector of ``width`` units; each enabled edge ``src -> dst`` is a learnable
-``Linear(width[src], width[dst])``; a node sums its incoming edges plus a bias and
-applies its activation.  The input node is the feature vector (concatenated token
-embeddings for modular tasks, flattened pixels for images); the output node emits
-the class logits.
+Evaluating such a graph one neuron at a time would be hopelessly slow, so the
+network is compiled into a handful of **masked dense matmuls**:
 
-**Convolutional mode** (image tasks with ``conv=True``).  Each node is a *spatial
-feature map* with ``width`` channels; each enabled edge between hidden nodes is a
-**same-padding** ``Conv2d`` (stride 1, so every map keeps the input resolution and
-arbitrary skip connections line up).  The input node is the image ``(C, H, W)``.
-Edges into the output node global-average-pool the source map and apply a
-``Linear`` to the class logits -- a standard GAP classifier head.
+* neurons are sorted into topological *levels* -- a level is a set of neurons
+  with no edges among themselves, so all of them can be computed at once;
+* level ``L`` reads every neuron computed before it, so its weights are one dense
+  ``(prefix, |L|)`` matrix paired with a 0/1 **connectivity mask**.  The mask is
+  applied at every forward pass, so gradients flow only along edges the genome
+  actually has -- absent edges are exactly zero and stay that way;
+* activations are applied per neuron (neurons in one level may carry different
+  activation genes), and output neurons emit their pre-activation sum as logits.
 
-The training recipe (``init_scale``, ``dropout``, ``embed_dim``) is *not* part
-of the genome -- it arrives as a :class:`~evogrokking.hyperparams.Hyperparams`
-fixed for the whole run.  ``init_scale`` multiplies every weight; a large initial
-weight norm together with weight decay is a documented driver of grokking (Liu et
-al., "Omnigrok").
+The result is mathematically the per-neuron sparse network the genome describes,
+but it runs as a few big GEMMs instead of thousands of tiny ones.
 """
 
 from __future__ import annotations
@@ -31,7 +28,7 @@ import torch
 import torch.nn as nn
 
 from evogrokking.datasets import DatasetSpec
-from evogrokking.genome import INPUT, OUTPUT, Genome
+from evogrokking.genome import Genome
 from evogrokking.hyperparams import Hyperparams
 
 _ACT = {
@@ -39,17 +36,18 @@ _ACT = {
     "gelu": torch.nn.functional.gelu,
     "tanh": torch.tanh,
     "silu": torch.nn.functional.silu,
+    "identity": lambda t: t,
 }
 
 
-def _reverse_reachable(conns, start: int) -> set[int]:
-    """Nodes that can reach ``start`` via *enabled* edges (incl. ``start``)."""
+def _reverse_reachable(conns, starts) -> set[int]:
+    """Nodes that can reach any of ``starts`` via *enabled* edges (incl. them)."""
     radj: dict[int, list[int]] = {}
     for c in conns:
         if c.enabled:
             radj.setdefault(c.dst, []).append(c.src)
-    seen = {start}
-    stack = [start]
+    seen = set(starts)
+    stack = list(starts)
     while stack:
         n = stack.pop()
         for m in radj.get(n, ()):
@@ -59,14 +57,27 @@ def _reverse_reachable(conns, start: int) -> set[int]:
     return seen
 
 
-def _topo_order(conns, active: set[int]) -> list[int]:
-    """Kahn topological sort of ``active`` nodes over enabled edges."""
+def _levels(conns, active: set[int], inputs: set[int]) -> list[list[int]]:
+    """Group ``active`` nodes into topological levels over enabled edges.
+
+    Level 0 is the input neurons; a node lands one level after the deepest node
+    feeding it, so no level contains an edge between two of its own members --
+    the invariant the whole masked-matmul scheme rests on.
+
+    Non-input neurons are seeded at depth **1**, not 0, *before* propagation.  A
+    neuron with no incoming edges is a learned constant (just its bias) and must
+    still be computed before anything it feeds; seeding it at 0 and bumping it
+    afterwards would let a consumer settle at depth 1 alongside it, putting an
+    edge *inside* a level -- where the mask cannot represent it.
+    """
+    depth: dict[int, int] = {n: (0 if n in inputs else 1) for n in active}
     succ: dict[int, list[int]] = {n: [] for n in active}
     indeg: dict[int, int] = {n: 0 for n in active}
     for c in conns:
         if c.enabled and c.src in active and c.dst in active:
             succ[c.src].append(c.dst)
             indeg[c.dst] += 1
+
     queue = [n for n in active if indeg[n] == 0]
     order: list[int] = []
     while queue:
@@ -76,11 +87,20 @@ def _topo_order(conns, active: set[int]) -> list[int]:
             indeg[m] -= 1
             if indeg[m] == 0:
                 queue.append(m)
-    return order
+    # ``order`` is a valid topological order, so every predecessor of ``n`` has
+    # its final depth by the time ``n`` is processed.
+    for n in order:
+        for m in succ[n]:
+            depth[m] = max(depth[m], depth[n] + 1)
+
+    by_depth: dict[int, list[int]] = {}
+    for n in active:
+        by_depth.setdefault(depth[n], []).append(n)
+    return [sorted(by_depth[d]) for d in sorted(by_depth)]
 
 
 class GrokNet(nn.Module):
-    """Network described by a NEAT graph genome (linear or convolutional)."""
+    """The MLP described by a classical NEAT genome."""
 
     def __init__(self, genome: Genome, spec: DatasetSpec, hp: Hyperparams | None = None):
         super().__init__()
@@ -88,129 +108,90 @@ class GrokNet(nn.Module):
         self.spec = spec
         self.hp = hp
         self.dropout_p = hp.dropout
-        self.is_conv = bool(genome.conv and spec.image_shape is not None)
+        self.n_inputs = genome.n_inputs
+        self.n_outputs = genome.n_outputs
 
-        # Per-node output size: units (linear) or channels (conv); the input and
-        # output nodes are sized by the dataset.
-        if self.is_conv:
-            self.embedding = None
-            channels, self.image_shape = spec.image_shape[0], spec.image_shape
-            # Downsample the input once so every same-conv map runs at the reduced
-            # resolution -- the main lever on conv activation memory.
-            self.conv_pool = max(1, genome.conv_pool)
-            self.eff_hw = (
-                self.image_shape[1] // self.conv_pool,
-                self.image_shape[2] // self.conv_pool,
-            )
-            sizes = {INPUT: channels, OUTPUT: spec.num_classes}
-            self.kernels: dict[int, int] = {}
-        elif spec.task == "modular":
-            assert spec.vocab_size is not None
-            self.embedding = nn.Embedding(spec.vocab_size, hp.embed_dim)
-            sizes = {INPUT: spec.input_dim * hp.embed_dim, OUTPUT: spec.num_classes}
-        else:
-            self.embedding = None
-            sizes = {INPUT: spec.input_dim, OUTPUT: spec.num_classes}
+        inputs = set(genome.input_ids())
+        outputs = genome.output_ids()
+        acts = genome.activations()
 
-        self.acts: dict[int, str] = {}
-        for node in genome.nodes:
-            sizes[node.id] = node.width
-            self.acts[node.id] = node.activation
-            if self.is_conv:
-                self.kernels[node.id] = node.kernel_size
+        # Only neurons that can reach an output matter; keep every input neuron
+        # in the prefix so the input vector maps onto columns directly.
+        active = _reverse_reachable(genome.conns, outputs) | inputs
+        raw_levels = _levels(genome.conns, active, inputs)
 
-        # Only the sub-graph that can reach the output matters.
-        active = _reverse_reachable(genome.conns, OUTPUT)
-        self.order = [n for n in _topo_order(genome.conns, active) if n != INPUT]
+        # Column index of every active neuron in the running activation tensor.
+        # Inputs come first, in feature order, so x maps straight onto them.
+        self.col: dict[int, int] = {nid: i for i, nid in enumerate(genome.input_ids())}
+        self.levels: list[list[int]] = [
+            [n for n in level if n not in inputs] for level in raw_levels
+        ]
+        self.levels = [lv for lv in self.levels if lv]
 
-        # One module per enabled edge whose endpoints are both active; one bias
-        # per computed node.  ModuleDict/ParameterDict keys must be strings.
-        self.edges = nn.ModuleDict()
-        self.incoming: dict[int, list[tuple[int, str]]] = {n: [] for n in self.order}
+        incoming: dict[int, list[int]] = {}
         for c in genome.conns:
-            if not (c.enabled and c.src in active and c.dst in active and c.dst != INPUT):
-                continue
-            key = f"{c.src}_{c.dst}"
-            self.edges[key] = self._make_edge(sizes, c.src, c.dst)
-            self.incoming[c.dst].append((c.src, key))
+            if c.enabled and c.src in active and c.dst in active and c.dst not in inputs:
+                incoming.setdefault(c.dst, []).append(c.src)
 
-        self.biases = nn.ParameterDict(
-            {str(n): nn.Parameter(torch.zeros(sizes[n])) for n in self.order}
+        self.weights = nn.ParameterList()
+        self.biases = nn.ParameterList()
+        self._act_groups: list[list[tuple[str, torch.Tensor]]] = []
+
+        prefix = genome.n_inputs
+        for li, level in enumerate(self.levels):
+            width = len(level)
+            mask = torch.zeros(prefix, width)
+            for j, nid in enumerate(level):
+                for src in incoming.get(nid, ()):
+                    si = self.col.get(src)
+                    if si is not None and si < prefix:
+                        mask[si, j] = 1.0
+            # Fan-in scaled init, as for a dense layer of the same connectivity.
+            fan_in = mask.sum(dim=0).clamp_min(1.0)
+            w = torch.randn(prefix, width) / fan_in.sqrt()
+            self.weights.append(nn.Parameter(w * hp.init_scale))
+            self.biases.append(nn.Parameter(torch.zeros(width)))
+            self.register_buffer(f"mask_{li}", mask, persistent=False)
+
+            # Per-neuron activations; outputs stay linear (they are logits).
+            groups: dict[str, list[int]] = {}
+            for j, nid in enumerate(level):
+                name = "identity" if nid < genome.n_outputs else acts.get(nid, "relu")
+                groups.setdefault(name, []).append(j)
+            self._act_groups.append(
+                [(name, torch.tensor(idx, dtype=torch.long)) for name, idx in groups.items()]
+            )
+            for j, nid in enumerate(level):
+                self.col[nid] = prefix + j
+            prefix += width
+
+        # Where the output logits ended up in the final activation tensor.  An
+        # output with no path from the input is still built (as a pure bias), so
+        # every class always gets a logit.
+        self.register_buffer(
+            "out_index",
+            torch.tensor([self.col[o] for o in outputs], dtype=torch.long),
+            persistent=False,
         )
-        self.input_used = INPUT in active
-        self._scale_init(hp.init_scale)
-
-    def _make_edge(self, sizes: dict[int, int], src: int, dst: int) -> nn.Module:
-        if not self.is_conv:
-            return nn.Linear(sizes[src], sizes[dst], bias=False)
-        if dst == OUTPUT:
-            # Leaving the spatial domain: global-average-pool then classify.
-            return nn.Linear(sizes[src], sizes[dst], bias=False)
-        k = self.kernels[dst]
-        return nn.Conv2d(sizes[src], sizes[dst], k, padding=k // 2, bias=False)
-
-    def _scale_init(self, scale: float) -> None:
-        if scale == 1.0:
-            return
-        with torch.no_grad():
-            for module in self.modules():
-                if isinstance(module, (nn.Linear, nn.Embedding, nn.Conv2d)):
-                    module.weight.mul_(scale)
 
     # -- forward -----------------------------------------------------------
-    def _input_tensor(self, x: torch.Tensor) -> torch.Tensor:
-        if self.is_conv:
-            img = x.view(x.shape[0], *self.image_shape)
-            if self.conv_pool > 1:
-                img = torch.nn.functional.avg_pool2d(img, self.conv_pool)
-            return img
-        if self.embedding is not None:
-            return self.embedding(x).flatten(start_dim=1)
-        return x
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch = x.shape[0]
-        vals: dict[int, torch.Tensor] = {}
-        if self.input_used:
-            vals[INPUT] = self._input_tensor(x)
-
-        for node in self.order:
-            incoming = self.incoming[node]
-            bias = self.biases[str(node)]
-
-            if node == OUTPUT:
-                if incoming:
-                    pre = bias
-                    for src, key in incoming:
-                        feat = vals[src]
-                        if self.is_conv:
-                            feat = feat.mean(dim=(2, 3))  # global average pool
-                        pre = pre + self.edges[key](feat)
-                else:
-                    # No path to the output: emit the (broadcast) bias as logits.
-                    pre = bias.unsqueeze(0).expand(batch, -1)
-                vals[node] = pre  # logits: no activation
-                continue
-
-            if incoming:
-                pre = bias.view(1, -1, 1, 1) if self.is_conv else bias
-                for src, key in incoming:
-                    pre = pre + self.edges[key](vals[src])
+        acc = x
+        for i, level in enumerate(self.levels):
+            w = self.weights[i] * getattr(self, f"mask_{i}")
+            pre = acc @ w + self.biases[i]
+            groups = self._act_groups[i]
+            if len(groups) == 1:
+                h = _ACT[groups[0][0]](pre)
             else:
-                # A node with no incoming edges is a learned constant; broadcast
-                # its bias across the batch (and spatial dims in conv mode).
-                if self.is_conv:
-                    c, (h, w) = bias.shape[0], self.eff_hw
-                    pre = bias.view(1, c, 1, 1).expand(batch, c, h, w)
-                else:
-                    pre = bias.unsqueeze(0).expand(batch, -1)
-
-            h = _ACT[self.acts[node]](pre)
+                h = torch.empty_like(pre)
+                for name, idx in groups:
+                    idx = idx.to(pre.device)
+                    h = h.index_copy(1, idx, _ACT[name](pre.index_select(1, idx)))
             if self.dropout_p > 0:
                 h = torch.nn.functional.dropout(h, self.dropout_p, self.training)
-            vals[node] = h
-
-        return vals[OUTPUT]
+            acc = torch.cat([acc, h], dim=1)
+        return acc.index_select(1, self.out_index)
 
 
 def build_model(
@@ -224,29 +205,22 @@ def count_parameters(model: nn.Module) -> int:
 
 
 # Rough multiplier turning stored-activation elements into peak training memory
-# (forward activations + gradients + conv workspace slack).
+# (forward activations + gradients + autograd slack).
 _ACT_OVERHEAD = 3.0
 
 
-def estimated_activation_mb(
-    genome: Genome, spec: DatasetSpec, batch_size: int, embed_dim: int = 128
-) -> float:
-    """Estimate the peak activation memory (MB) of a full-batch fwd+bwd pass.
+def estimated_activation_mb(genome: Genome, spec: DatasetSpec, batch_size: int) -> float:
+    """Estimate the peak memory (MB) of a full-batch fwd+bwd pass.
 
-    Used as a cheap, build-free guard so the evolutionary search can skip
-    genomes that would exceed the GPU-memory budget instead of OOM-ing on them.
-    Sums ``batch * units`` over the hidden nodes (units = channels x H x W in conv
-    mode, at the pooled resolution), a conservative upper bound that ignores dead
-    genes.
+    Used as a cheap, build-free guard so the evolutionary search can skip genomes
+    that would exceed the memory budget instead of OOM-ing on them.  Counts the
+    activation tensor -- which, because levels are concatenated, is re-materialised
+    at every level -- plus the dense level weight matrices, whose size is what
+    really grows as the graph deepens.
     """
-    if genome.conv and spec.image_shape is not None:
-        c0, h, w = spec.image_shape
-        pool = max(1, genome.conv_pool)
-        spatial = (h // pool) * (w // pool)
-        elems = batch_size * c0 * spatial  # input feature map
-        elems += batch_size * sum(n.width * spatial for n in genome.nodes)
-    else:
-        in_dim = spec.input_dim * (embed_dim if spec.task == "modular" else 1)
-        elems = batch_size * in_dim
-        elems += batch_size * sum(n.width for n in genome.nodes)
-    return elems * 4 * _ACT_OVERHEAD / (1024 * 1024)
+    n_hidden = len(genome.hidden_ids())
+    total_nodes = genome.n_inputs + n_hidden + genome.n_outputs
+    n_levels = max(2, min(n_hidden + 1, 8))  # unknown before building; assume shallow
+    act_elems = batch_size * total_nodes * n_levels
+    weight_elems = total_nodes * (n_hidden + genome.n_outputs)
+    return (act_elems + weight_elems) * 4 * _ACT_OVERHEAD / (1024 * 1024)

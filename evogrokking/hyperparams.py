@@ -1,7 +1,7 @@
 """The **fixed** training recipe.
 
 Earlier versions of this project evolved the learning rate, weight decay,
-dropout, optimizer, init scale and embedding width alongside the network graph.
+dropout, optimizer and init scale alongside the network graph.
 That made it impossible to tell whether a good individual owed its behaviour to
 its *architecture* or merely to a lucky regularisation setting -- so those knobs
 are no longer genes.  They are set once per run (from the CLI) and shared by
@@ -31,7 +31,6 @@ class Hyperparams:
     dropout: float = 0.0
     optimizer: str = "adamw"
     init_scale: float = 8.0
-    embed_dim: int = 128  # modular tasks only: token-embedding width
 
     def __post_init__(self) -> None:
         if self.optimizer not in OPTIMIZERS:
@@ -48,9 +47,7 @@ class Hyperparams:
         all (Power et al., 2022), which is the regime this project starts from.
         """
         if task == "modular":
-            return Hyperparams(
-                lr=1e-2, weight_decay=1.0, init_scale=1.0, embed_dim=128
-            )
+            return Hyperparams(lr=1e-2, weight_decay=1.0, init_scale=1.0)
         return Hyperparams()
 
     def with_overrides(self, **kwargs) -> "Hyperparams":
@@ -65,7 +62,7 @@ class Hyperparams:
     def summary(self) -> str:
         return (
             f"lr={self.lr:.2g} wd={self.weight_decay:.2g} do={self.dropout:.2f} "
-            f"opt={self.optimizer} init={self.init_scale:.2g} emb={self.embed_dim}"
+            f"opt={self.optimizer} init={self.init_scale:.2g}"
         )
 
     def as_dict(self) -> dict:
@@ -75,7 +72,6 @@ class Hyperparams:
             "dropout": self.dropout,
             "optimizer": self.optimizer,
             "init_scale": self.init_scale,
-            "embed_dim": self.embed_dim,
         }
 
     @classmethod

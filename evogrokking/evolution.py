@@ -1,10 +1,11 @@
 """Evolutionary architecture search for *minimal* grokking.
 
-A NEAT genetic algorithm -- supplied by
+A classical NEAT genetic algorithm -- supplied by
 `neat-python <https://neat-python.readthedocs.io>`_, see
 :mod:`evogrokking.neat_arch` -- searches the space of network *graphs* for the
 architecture that generalises **as early as possible** while still ending up
-accurate.  Each individual's fitness is obtained by actually training it
+accurate.  The population starts from a big, densely connected MLP, so the search
+mostly *prunes and rewires* rather than growing from a minimal seed.  Each individual's fitness is obtained by actually training it
 (:func:`~evogrokking.train.train_and_evaluate`) and scoring the run with
 :meth:`~evogrokking.metrics.GrokkingMetrics.score`, which rewards high final
 accuracy, a small train/validation gap and early generalisation.
@@ -25,6 +26,7 @@ individual can be retrained identically afterwards from that same seed.
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import time
@@ -70,8 +72,10 @@ class EvolutionConfig:
     eval_every: int = 2
     seed: int = 0
     workers: int = 1  # >1 evaluates the population across that many processes
-    allow_conv: bool = False  # image tasks: evolve convolutional feature maps
-    conv_pool: int = 1  # conv mode: input downsample factor (memory knob)
+    n_hidden: int = 64  # hidden neurons in the dense starting network
+    initial_connection: str = "full_direct"
+    initial_connection_fraction: float = 1.0  # <1 gives each founder a random subset
+    structural_mutation_rounds: int = 1  # NEAT operator repeats per genome
     mem_budget_mb: float | None = None  # skip genomes whose est. activation memory exceeds this
     hyperparams: Hyperparams = field(default_factory=Hyperparams)
 
@@ -84,13 +88,16 @@ class EvolutionConfig:
     # -- neat-python knobs -------------------------------------------------
     elitism: int = 2
     survival_threshold: float = 0.2
-    compatibility_threshold: float = 3.0
+    # Distances are normalised per gene by neat-python, so this is much smaller
+    # than textbook NEAT's ~3.0 -- see evogrokking.neat_arch.
+    compatibility_threshold: float = 0.2
     max_stagnation: int = 15
     species_elitism: int = 2
-    conn_add_prob: float = 0.5
-    conn_delete_prob: float = 0.2
-    node_add_prob: float = 0.3
-    node_delete_prob: float = 0.15
+    conn_add_prob: float = 0.3
+    conn_delete_prob: float = 0.4
+    node_add_prob: float = 0.15
+    node_delete_prob: float = 0.2
+    activation_mutate_rate: float = 0.05
 
     # Early stopping (applied to each individual's training run). ``patience`` is
     # counted in evaluations (i.e. units of ``eval_every`` epochs); None disables.
@@ -184,6 +191,7 @@ class Evolution:
         self.history: list[dict] = []
         self.best: Individual | None = None
         self._generation = 0
+        self._gate_warned = False
         self._pool: ProcessPoolExecutor | None = None
 
     # -- helpers -----------------------------------------------------------
@@ -208,7 +216,12 @@ class Evolution:
         write_config(
             self.config_path,
             pop_size=cfg.population_size,
-            conv=cfg.allow_conv,
+            n_inputs=self.dataset.spec.input_dim,
+            n_outputs=self.dataset.spec.num_classes,
+            n_hidden=cfg.n_hidden,
+            initial_connection=cfg.initial_connection,
+            initial_connection_fraction=cfg.initial_connection_fraction,
+            structural_mutation_rounds=cfg.structural_mutation_rounds,
             elitism=cfg.elitism,
             survival_threshold=cfg.survival_threshold,
             compatibility_threshold=cfg.compatibility_threshold,
@@ -218,6 +231,7 @@ class Evolution:
             conn_delete_prob=cfg.conn_delete_prob,
             node_add_prob=cfg.node_add_prob,
             node_delete_prob=cfg.node_delete_prob,
+            activation_mutate_rate=cfg.activation_mutate_rate,
         )
         return neat.Config(
             ArchGenome,
@@ -232,10 +246,7 @@ class Evolution:
         if budget is None:
             return False
         mb = estimated_activation_mb(
-            genome,
-            self.dataset.spec,
-            len(self.dataset.x_train),
-            embed_dim=self.config.hyperparams.embed_dim,
+            genome, self.dataset.spec, len(self.dataset.x_train)
         )
         return mb > budget
 
@@ -248,8 +259,9 @@ class Evolution:
         individuals: list[tuple[object, Individual]] = []
         pending: list[Individual] = []
         skipped = 0
+        spec = self.dataset.spec
         for _gid, ng in neat_genomes:
-            genome = to_genome(ng, conv=cfg.allow_conv, conv_pool=cfg.conv_pool)
+            genome = to_genome(ng, spec.input_dim, spec.num_classes)
             ind = Individual(genome)
             individuals.append((ng, ind))
             if self._over_budget(genome):
@@ -309,6 +321,25 @@ class Evolution:
 
         try:
             population.run(fitness_function, cfg.generations)
+        except RuntimeError as e:
+            if "Cannot satisfy per-species minima" not in str(e):
+                raise
+            raise RuntimeError(
+                "The population split into more species than it can sustain: "
+                "neat-python must keep max(min_species_size, elitism) genomes in "
+                "every species, and that exceeded --population.\n"
+                "This happens when the genomes are very diverse but the "
+                "compatibility threshold is low.  Fixes, in rough order of "
+                "preference:\n"
+                f"  * raise --compatibility-threshold (currently "
+                f"{cfg.compatibility_threshold}) so similar genomes share a "
+                "species;\n"
+                f"  * raise --population (currently {cfg.population_size});\n"
+                f"  * lower --elitism (currently {cfg.elitism}).\n"
+                "If you are using --initial-connection-fraction < 1, the founders "
+                "start diverse, so a higher --compatibility-threshold is usually "
+                "needed with it."
+            ) from e
         finally:
             if self._pool is not None:
                 self._pool.shutdown()
@@ -317,8 +348,37 @@ class Evolution:
         assert self.best is not None
         return self.best
 
+    def _warn_if_gate_shut(self, population: list[Individual]) -> None:
+        """Warn once when no individual is anywhere near ``gen_threshold``.
+
+        Below the threshold the accuracy gate is ~0, so the whole anti-grokking
+        half of the objective is multiplied away and the score collapses to plain
+        validation accuracy.  The search still runs, but it is no longer
+        minimising grokking -- and nothing else in the log says so.
+        """
+        if self._gate_warned:
+            return
+        accs = [
+            i.result.metrics.final_val_acc for i in population if i.result is not None
+        ]
+        if not accs:
+            return
+        thr = self.config.gen_threshold
+        best_gate = 1.0 / (1.0 + math.exp(-30.0 * (max(accs) - thr)))
+        if best_gate < 1e-3:
+            self._gate_warned = True
+            print(
+                f"  !! accuracy gate is shut: best val_acc {max(accs):.1%} vs "
+                f"--gen-threshold {thr:.2f} (gate={best_gate:.1e}).\n"
+                f"     Fitness has collapsed to plain validation accuracy -- the "
+                f"grokking terms contribute nothing.\n"
+                f"     Lower --gen-threshold below the accuracy runs actually "
+                f"reach, or train longer (--epochs)."
+            )
+
     # -- logging -----------------------------------------------------------
     def _record(self, gen: int, population: list[Individual], secs: float) -> None:
+        self._warn_if_gate_shut(population)
         best = population[0]
         fitnesses = [i.fitness for i in population]
         entry = {

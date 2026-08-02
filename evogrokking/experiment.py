@@ -28,7 +28,7 @@ Examples
 --------
     python -m evogrokking.experiment train   --dataset mnist --epochs 4000 --plot
     python -m evogrokking.experiment evolve  --dataset mnist --generations 12 \
-        --population 24 --workers 4 --conv --name mnist_search
+        --population 24 --workers 4 --name mnist_search
     python -m evogrokking.experiment retrain --from mnist_search --epochs 8000
 """
 
@@ -43,7 +43,7 @@ import torch
 
 from evogrokking import datasets
 from evogrokking.evolution import Evolution, EvolutionConfig
-from evogrokking.genome import INPUT, OUTPUT, ConnGene, Genome, Innovations, NodeGene
+from evogrokking.genome import Genome
 from evogrokking.hyperparams import OPTIMIZERS, Hyperparams
 from evogrokking.plots import plot_curves, plot_genome
 from evogrokking.train import EarlyStopping, default_device, train_and_evaluate
@@ -89,47 +89,20 @@ def _hyperparams(args, dataset: datasets.Dataset) -> Hyperparams:
         dropout=args.dropout,
         optimizer=args.optimizer,
         init_scale=args.init_scale,
-        embed_dim=args.embed_dim,
     )
 
 
-def _baseline_genome(
-    dataset: datasets.Dataset, conv: bool = False, conv_pool: int = 1
-) -> Genome:
-    """A hand-picked single-hidden-node graph: a reasonable reference point on
-    every task.  Built directly as a NEAT graph (input -> hidden -> output) so it
-    round-trips through the same code path as evolved genomes.  With ``conv`` the
-    hidden node is a conv feature map."""
-    if dataset.spec.task == "modular":
-        width, act, kernel = 256, "relu", 3
-    elif conv:
-        width, act, kernel = 16, "relu", 3  # 16 conv channels, 3x3 filters
-    else:
-        width, act, kernel = 256, "relu", 3
+def _baseline_genome(dataset: datasets.Dataset, n_hidden: int) -> Genome:
+    """The **big densely connected** starting network, as a genome.
 
-    innov = Innovations()
-    c_in_out = innov.conn(INPUT, OUTPUT)
-    hid = innov.split_node(c_in_out)
-    return Genome(
-        nodes=(NodeGene(hid, width, act, kernel),),
-        conns=(
-            ConnGene(c_in_out, INPUT, OUTPUT, False),
-            ConnGene(innov.conn(INPUT, hid), INPUT, hid, True),
-            ConnGene(innov.conn(hid, OUTPUT), hid, OUTPUT, True),
-        ),
-        conv=conv and dataset.spec.task == "image",
-        conv_pool=conv_pool,
+    One neuron per input feature, ``n_hidden`` hidden neurons, one neuron per
+    class, fully wired (including direct input -> output edges).  This is exactly
+    the founding structure the search starts from, so ``train`` measures the
+    baseline the search is trying to improve on.
+    """
+    return Genome.dense(
+        dataset.spec.input_dim, dataset.spec.num_classes, n_hidden
     )
-
-
-def _conv_enabled(args, dataset: datasets.Dataset) -> bool:
-    """Convolutions only make sense for image tasks; warn if asked for elsewhere."""
-    if not getattr(args, "conv", False):
-        return False
-    if dataset.spec.task != "image":
-        print(f"note: --conv ignored for non-image task {dataset.spec.name!r}")
-        return False
-    return True
 
 
 def _run_dir(name: str) -> str:
@@ -177,13 +150,9 @@ def _plot_result(out: str, result, eval_every: int, title: str) -> None:
     print(f"Saved learning-curve plot to {path}")
 
 
-def _plot_structure(out: str, genome: Genome, spec, title: str, embed_dim: int) -> None:
+def _plot_structure(out: str, genome: Genome, spec, title: str) -> None:
     path = plot_genome(
-        genome,
-        os.path.join(out, "structure.png"),
-        spec=spec,
-        title=title,
-        embed_dim=embed_dim,
+        genome, os.path.join(out, "structure.png"), spec=spec, title=title
     )
     print(f"Saved network-structure graph to {path}")
 
@@ -194,9 +163,8 @@ def cmd_train(args) -> None:
     random.seed(args.seed)
     device = default_device()
     dataset = _load_dataset(args)
-    conv = _conv_enabled(args, dataset)
     hp = _hyperparams(args, dataset)
-    genome = _baseline_genome(dataset, conv=conv, conv_pool=args.conv_pool)
+    genome = _baseline_genome(dataset, args.hidden)
     print(
         f"Device: {device} | dataset: {dataset.spec.name} "
         f"({len(dataset.x_train)} train / {len(dataset.x_val)} val)\n"
@@ -242,8 +210,7 @@ def cmd_train(args) -> None:
             out,
             genome,
             dataset.spec,
-            f"Baseline architecture — {dataset.spec.name}\n{genome.summary()}",
-            hp.embed_dim,
+            f"Dense baseline — {dataset.spec.name}\n{genome.summary()}",
         )
     print(f"\nSaved to {out}/")
 
@@ -263,8 +230,10 @@ def cmd_evolve(args) -> None:
         eval_every=args.eval_every,
         seed=args.seed,
         workers=args.workers,
-        allow_conv=_conv_enabled(args, dataset),
-        conv_pool=args.conv_pool,
+        n_hidden=args.hidden,
+        initial_connection=args.initial_connection,
+        initial_connection_fraction=args.initial_connection_fraction,
+        structural_mutation_rounds=args.mutation_rounds,
         mem_budget_mb=(args.mem_budget_mb or None),  # 0 disables the guard
         hyperparams=hp,
         acc_weight=args.acc_weight,
@@ -276,6 +245,7 @@ def cmd_evolve(args) -> None:
         compatibility_threshold=args.compatibility_threshold,
         max_stagnation=args.max_stagnation,
         species_elitism=args.species_elitism,
+        activation_mutate_rate=args.activation_mutate_rate,
         early_stop_patience=args.patience,
         early_stop_min_delta=args.min_delta,
         early_stop_target_val_acc=args.target_val_acc,
@@ -284,8 +254,9 @@ def cmd_evolve(args) -> None:
         f"Device: {default_device()} | dataset: {dataset.spec.name} "
         f"({len(dataset.x_train)} train / {len(dataset.x_val)} val)\n"
         f"  search: pop={config.population_size} gens={config.generations} "
-        f"epochs/eval={config.epochs_per_eval} workers={config.workers} "
-        f"conv={config.allow_conv}\n"
+        f"epochs/eval={config.epochs_per_eval} workers={config.workers}\n"
+        f"  start: dense {dataset.spec.input_dim}-{config.n_hidden}-"
+        f"{dataset.spec.num_classes} ({config.initial_connection})\n"
         f"  recipe (fixed, not evolved): {hp.summary()}\n"
         f"  objective: minimise grokking "
         f"(acc x{config.acc_weight} + gap x{config.gap_weight} "
@@ -435,7 +406,6 @@ def cmd_retrain(args) -> None:
         genome,
         dataset.spec,
         f"Evolved architecture — {dataset.spec.name}\n{genome.summary()}",
-        hp.embed_dim,
     )
     print(f"\nSaved retrained weights + curves + structure to {run}/")
 
@@ -465,17 +435,14 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument("--eval-every", type=int, default=2)
         p.add_argument(
-            "--conv",
-            action="store_true",
-            help="image tasks only: evolve/use convolutional feature maps (nodes "
-            "become spatial channels, edges become same-padding conv filters)",
-        )
-        p.add_argument(
-            "--conv-pool",
+            "--hidden",
             type=int,
-            default=2,
-            help="conv mode: downsample the input by this factor to cap activation "
-            "memory (1 = full resolution; default: 2)",
+            default=32,
+            help="hidden neurons in the big densely connected starting network "
+            "(default: 32). This sets the gene count -- roughly "
+            "(inputs + outputs) x hidden + inputs x outputs connections per "
+            "genome -- and neat-python's bookkeeping grows ~quadratically in it, "
+            "so raise it only if you can afford the wall-clock (see README)",
         )
         p.add_argument(
             "--mem-budget-mb",
@@ -527,9 +494,6 @@ def build_parser() -> argparse.ArgumentParser:
             type=float,
             default=None,
             help="multiply every initial weight by this (large init aids grokking)",
-        )
-        hg.add_argument(
-            "--embed-dim", type=int, default=None, help="modular tasks: embedding width"
         )
 
         # modular-task knobs
@@ -635,13 +599,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     ng = e.add_argument_group("neat-python")
+    ng.add_argument(
+        "--initial-connection",
+        default="full_direct",
+        choices=["full_direct", "full_nodirect"],
+        help="how the dense starting network is wired (default: full_direct, i.e. "
+        "input->hidden, hidden->output and input->output)",
+    )
+    ng.add_argument(
+        "--initial-connection-fraction",
+        type=float,
+        default=1.0,
+        help="give each founding genome its own random fraction of that wiring "
+        "(default: 1.0 = fully wired). Below 1.0 the founders differ from each "
+        "other, which is the cheapest way to get diversity into generation 0 -- "
+        "with full wiring every founder is identical and the first generation "
+        "trains the same network --population times",
+    )
+    ng.add_argument(
+        "--mutation-rounds",
+        type=int,
+        default=1,
+        help="repeat the NEAT add/delete operators this many times per genome "
+        "(default: 1). neat-python changes at most one gene of each kind per "
+        "generation, which is a negligible step for a dense genome of tens of "
+        "thousands of genes -- raise this so the step scales with the genome",
+    )
+    ng.add_argument(
+        "--activation-mutate-rate",
+        type=float,
+        default=0.05,
+        help="per-neuron chance of swapping activation function (default: 0.05)",
+    )
     ng.add_argument("--elitism", type=int, default=2)
     ng.add_argument("--survival-threshold", type=float, default=0.2)
     ng.add_argument(
         "--compatibility-threshold",
         type=float,
-        default=3.0,
-        help="genomic-distance threshold for splitting species (default: 3.0)",
+        default=0.2,
+        help="genomic-distance threshold for splitting species. neat-python "
+        "normalises distance per gene, so this is a *mean per-gene* difference "
+        "and is far below textbook NEAT's ~3.0 (default: 0.2)",
     )
     ng.add_argument("--max-stagnation", type=int, default=15)
     ng.add_argument("--species-elitism", type=int, default=2)

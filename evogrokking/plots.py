@@ -3,8 +3,9 @@
 * :func:`plot_curves` -- the log-loss and accuracy learning curves (the shaded
   gap on the log axis is exactly the *grokking area* we measure).
 * :func:`plot_genome` -- the evolved NEAT network as a graph, laid out
-  left-to-right by topological depth, so the obtained architecture (nodes, their
-  widths/kernels, and the skip connections between them) is visible at a glance.
+  left-to-right by topological depth.  Small graphs are drawn neuron by neuron;
+  larger ones collapse each level into a single box labelled with its neuron
+  count, with connection counts on the arrows.
 
 Matplotlib is imported lazily with the non-interactive ``Agg`` backend so this
 works headless (no display needed) and only costs anything when a plot is asked
@@ -16,7 +17,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Sequence
 
-from evogrokking.genome import INPUT, OUTPUT, Genome
+from evogrokking.genome import Genome
 
 
 def plot_curves(
@@ -98,13 +99,15 @@ def plot_curves(
 # --------------------------------------------------------------------------
 # Network-structure graph
 # --------------------------------------------------------------------------
-def _layered_layout(genome: Genome) -> tuple[dict[int, int], list[int]]:
-    """Assign each node a column = longest path from the input over *enabled*
-    edges (a standard feed-forward layering), returning ``{node: column}`` and the
-    topological order."""
-    node_ids = {INPUT, OUTPUT} | {n.id for n in genome.nodes}
-    enabled = [(c.src, c.dst) for c in genome.conns
-               if c.enabled and c.src in node_ids and c.dst in node_ids]
+def _levels(genome: Genome) -> dict[int, int]:
+    """Assign each neuron a column = longest path from an input over *enabled*
+    edges (a standard feed-forward layering)."""
+    node_ids = genome.node_ids()
+    enabled = [
+        (c.src, c.dst)
+        for c in genome.conns
+        if c.enabled and c.src in node_ids and c.dst in node_ids
+    ]
 
     succ: dict[int, list[int]] = {n: [] for n in node_ids}
     indeg: dict[int, int] = {n: 0 for n in node_ids}
@@ -127,98 +130,155 @@ def _layered_layout(genome: Genome) -> tuple[dict[int, int], list[int]]:
     for n in order:
         for d in succ[n]:
             depth[d] = max(depth[d], depth[n] + 1)
-    # Pin the output to the right-most column so it always reads as the head.
-    depth[OUTPUT] = max(depth.values())
-    return depth, order
+    # Inputs are always column 0 and outputs always the last, so the picture
+    # reads left-to-right even when a stray edge would say otherwise.
+    for n in genome.input_ids():
+        depth[n] = 0
+    last = max(depth.values(), default=1)
+    for n in genome.output_ids():
+        depth[n] = max(last, 1)
+    return depth
+
+
+#: Above this many neurons the per-neuron picture is unreadable, so levels are
+#: drawn collapsed into one box each.
+DETAIL_LIMIT = 60
 
 
 def plot_genome(
-    genome: Genome, out_path: str, *, spec=None, title: str = "", embed_dim: int = 128
+    genome: Genome, out_path: str, *, spec=None, title: str = "", detail_limit: int | None = None
 ) -> str:
     """Render the evolved network as a left-to-right graph. Returns ``out_path``.
 
-    Nodes are the input, output and hidden units (labelled with their width /
-    channels + kernel and activation); solid arrows are the enabled connections
-    that make up the trained network, faint dotted arrows the disabled genes the
-    genome still carries.
+    Classical NEAT graphs have one node per *neuron*, so an MNIST genome has 784
+    input neurons and can carry tens of thousands of edges -- far past what any
+    node-and-arrow diagram can show.  Two modes handle that:
+
+    * **detailed** (small graphs): every neuron is a box labelled with its id and
+      activation; solid arrows are the enabled connections, faint dotted arrows
+      the disabled genes the genome still carries.
+    * **collapsed** (anything larger): each topological level becomes one box
+      giving its neuron count, and each pair of levels one arrow labelled with the
+      number of connections running between them -- so the *shape* of the evolved
+      network, and where it is densely or sparsely wired, is still legible.
     """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    depth, _ = _layered_layout(genome)
+    limit = DETAIL_LIMIT if detail_limit is None else detail_limit
+    depth = _levels(genome)
+    n_nodes = len(depth)
+    acts = genome.activations()
+    inputs = set(genome.input_ids())
+    outputs = set(genome.output_ids())
+
     columns: dict[int, list[int]] = {}
     for node, col in depth.items():
         columns.setdefault(col, []).append(node)
+    n_cols = max(columns) + 1
 
-    # Position: x = column, y = evenly spread within the column (input/output
-    # centred, hidden ordered by id for a stable picture).
-    pos: dict[int, tuple[float, float]] = {}
-    for col, members in columns.items():
-        members = sorted(members)
-        k = len(members)
-        for i, node in enumerate(members):
-            pos[node] = (float(col), (k - 1) / 2.0 - i)
+    detailed = n_nodes <= limit
 
-    n_cols = max(depth.values()) + 1
-    max_rows = max(len(m) for m in columns.values())
-    fig, ax = plt.subplots(figsize=(max(6.0, 2.4 * n_cols), max(3.0, 1.5 * max_rows)))
-
-    is_conv = genome.conv
-    kernels = {n.id: n.kernel_size for n in genome.nodes}
-    acts = {n.id: n.activation for n in genome.nodes}
-    widths = {n.id: n.width for n in genome.nodes}
-
-    def label(node: int) -> str:
-        if node == INPUT:
-            if spec is None:
-                return "input"
-            if spec.task == "modular":
-                return f"input\n2×{embed_dim} emb"
-            if is_conv and spec.image_shape:
-                c, h, w = spec.image_shape
-                pooled = f" ÷{genome.conv_pool}" if genome.conv_pool > 1 else ""
-                return f"input\nimage {c}×{h}×{w}{pooled}"
-            return f"input\n{spec.input_dim}px"
-        if node == OUTPUT:
-            return "output" + (f"\n{spec.num_classes} classes" if spec else "")
-        if is_conv:
-            return f"#{node}\n{widths[node]}ch·k{kernels[node]}\n{acts[node]}"
-        return f"#{node}\n{widths[node]}u·{acts[node]}"
-
-    def style(node: int):
-        if node == INPUT:
-            return "#d9f0d3", "#2ca02c"
-        if node == OUTPUT:
-            return "#f7d5d5", "#d62728"
-        return ("#e7dcf0", "#9467bd") if is_conv else ("#d6e5f3", "#1f77b4")
-
-    # Edges first (behind the node boxes).
-    for c in genome.conns:
-        if c.src not in pos or c.dst not in pos:
-            continue
-        x0, y0 = pos[c.src]
-        x1, y1 = pos[c.dst]
-        if c.enabled:
-            arrow = dict(arrowstyle="-|>", color="#555555", lw=1.4,
-                         shrinkA=18, shrinkB=18, connectionstyle="arc3,rad=0.08")
-        else:
-            arrow = dict(arrowstyle="-|>", color="#cccccc", lw=0.8, ls=":",
-                         shrinkA=18, shrinkB=18, alpha=0.7,
-                         connectionstyle="arc3,rad=0.08")
-        ax.annotate("", xy=(x1, y1), xytext=(x0, y0), arrowprops=arrow, zorder=1)
-
-    # Node boxes.
-    for node, (x, y) in pos.items():
-        face, edge = style(node)
-        ax.text(
-            x, y, label(node), ha="center", va="center", fontsize=9, zorder=2,
-            bbox=dict(boxstyle="round,pad=0.4", facecolor=face, edgecolor=edge, lw=1.6),
+    if detailed:
+        pos: dict[int, tuple[float, float]] = {}
+        for col, members in columns.items():
+            members = sorted(members)
+            k = len(members)
+            for i, node in enumerate(members):
+                pos[node] = (float(col), (k - 1) / 2.0 - i)
+        max_rows = max(len(m) for m in columns.values())
+        fig, ax = plt.subplots(
+            figsize=(max(6.0, 2.4 * n_cols), max(3.0, 0.9 * max_rows))
         )
 
-    ax.set_xlim(-0.6, n_cols - 0.4)
-    ax.set_ylim(-max_rows / 2 - 0.8, max_rows / 2 + 0.8)
+        for c in genome.conns:
+            if c.src not in pos or c.dst not in pos:
+                continue
+            x0, y0 = pos[c.src]
+            x1, y1 = pos[c.dst]
+            if c.enabled:
+                arrow = dict(arrowstyle="-|>", color="#555555", lw=1.0, alpha=0.75,
+                             shrinkA=14, shrinkB=14, connectionstyle="arc3,rad=0.08")
+            else:
+                arrow = dict(arrowstyle="-|>", color="#cccccc", lw=0.7, ls=":",
+                             shrinkA=14, shrinkB=14, alpha=0.6,
+                             connectionstyle="arc3,rad=0.08")
+            ax.annotate("", xy=(x1, y1), xytext=(x0, y0), arrowprops=arrow, zorder=1)
+
+        for node, (x, y) in pos.items():
+            if node in inputs:
+                label, face, edge = f"in{-node}", "#d9f0d3", "#2ca02c"
+            elif node in outputs:
+                label, face, edge = f"out{node}", "#f7d5d5", "#d62728"
+            else:
+                label, face, edge = f"#{node}\n{acts.get(node, '?')}", "#d6e5f3", "#1f77b4"
+            ax.text(
+                x, y, label, ha="center", va="center", fontsize=8, zorder=2,
+                bbox=dict(boxstyle="round,pad=0.35", facecolor=face, edgecolor=edge, lw=1.4),
+            )
+        ax.set_ylim(-max_rows / 2 - 0.8, max_rows / 2 + 0.8)
+    else:
+        # Collapsed: one box per level, arrows labelled with connection counts.
+        level_of = depth
+        pair_counts: dict[tuple[int, int], int] = {}
+        for c in genome.conns:
+            if not c.enabled or c.src not in level_of or c.dst not in level_of:
+                continue
+            key = (level_of[c.src], level_of[c.dst])
+            pair_counts[key] = pair_counts.get(key, 0) + 1
+
+        fig, ax = plt.subplots(figsize=(max(7.0, 2.6 * n_cols), 4.2))
+        pos = {col: (float(col), 0.0) for col in columns}
+
+        for (a, b), count in sorted(pair_counts.items()):
+            x0, _ = pos[a]
+            x1, _ = pos[b]
+            rad = 0.0 if b == a + 1 else 0.45  # curve the skip connections
+            ax.annotate(
+                "", xy=(x1, 0.0), xytext=(x0, 0.0),
+                arrowprops=dict(arrowstyle="-|>", color="#555555", lw=1.3,
+                                shrinkA=34, shrinkB=34,
+                                connectionstyle=f"arc3,rad={rad}"),
+                zorder=1,
+            )
+            # Straight arrows are labelled just above the line; skip arcs bow
+            # *below* the row of boxes, so their labels follow them down rather
+            # than landing on top of the level they jump over.
+            if rad == 0.0:
+                ly, va = 0.10, "bottom"
+            else:
+                ly, va = -(0.28 + 0.55 * abs(rad)), "top"
+            ax.text(
+                (x0 + x1) / 2, ly, f"{count:,}",
+                ha="center", va=va, fontsize=8, color="#333333", zorder=3,
+            )
+
+        for col, members in sorted(columns.items()):
+            k = len(members)
+            if col == 0:
+                label, face, edge = f"input\n{k:,} neurons", "#d9f0d3", "#2ca02c"
+            elif set(members) <= outputs:
+                label, face, edge = f"output\n{k} neurons", "#f7d5d5", "#d62728"
+            else:
+                used = sorted({acts[m] for m in members if m in acts})
+                label = f"level {col}\n{k:,} neurons\n{'/'.join(used) or '-'}"
+                face, edge = "#d6e5f3", "#1f77b4"
+            ax.text(
+                col, 0.0, label, ha="center", va="center", fontsize=9, zorder=2,
+                bbox=dict(boxstyle="round,pad=0.45", facecolor=face, edgecolor=edge, lw=1.6),
+            )
+        ax.set_ylim(-1.2, 1.6)
+        ax.text(
+            0.5, 0.02,
+            f"levels collapsed ({n_nodes:,} neurons, {genome.n_enabled():,} enabled "
+            f"connections); arrow labels are connection counts",
+            transform=ax.transAxes, ha="center", va="bottom",
+            fontsize=8, color="#666666",
+        )
+
+    ax.set_xlim(-0.7, n_cols - 0.3)
     ax.axis("off")
     ax.set_title(title or genome.summary(), fontsize=10)
     fig.tight_layout()
